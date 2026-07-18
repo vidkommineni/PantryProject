@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>What's In My Pantry</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>What's In My Pantry</h1>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="search">Search</button>
+    <button class="tab-btn" data-tab="spices">Spice Inventory</button>
+    <button class="tab-btn" data-tab="staples">Staples</button>
+    <button class="tab-btn" data-tab="favorites">Favorites</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- SEARCH TAB -->
+  <section id="tab-search" class="tab-panel active">
+    <form id="search-form" class="search-form">
+      <div class="field">
+        <label for="ingredients-box">Ingredients you have</label>
+        <textarea id="ingredients-box" rows="3" placeholder="e.g. chicken breast, broccoli, rice&#10;(comma or newline separated)"></textarea>
+        <div id="autocomplete-list" class="autocomplete-list"></div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="servings">Servings</label>
+          <input type="number" id="servings" min="1" max="12" value="4">
+        </div>
+        <div class="field">
+          <label for="max-ready-time">Time available</label>
+          <select id="max-ready-time">
+            <option value="">Any</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="45">45 min</option>
+            <option value="60">1 hour</option>
+            <option value="120">2 hours</option>
+          </select>
+        </div>
+        <div class="field checkbox-field">
+          <label><input type="checkbox" id="use-spices" checked> Include my spice inventory</label>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>Dietary restrictions</label>
+          <div class="chip-group" id="diet-chips">
+            <button type="button" class="chip" data-value="vegetarian">Vegetarian</button>
+            <button type="button" class="chip" data-value="vegan">Vegan</button>
+            <button type="button" class="chip" data-value="ketogenic">Keto</button>
+            <button type="button" class="chip" data-value="paleo">Paleo</button>
+            <button type="button" class="chip" data-value="pescetarian">Pescetarian</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Intolerances</label>
+          <div class="chip-group" id="intolerance-chips">
+            <button type="button" class="chip" data-value="dairy">Dairy</button>
+            <button type="button" class="chip" data-value="egg">Egg</button>
+            <button type="button" class="chip" data-value="gluten">Gluten</button>
+            <button type="button" class="chip" data-value="peanut">Peanut</button>
+            <button type="button" class="chip" data-value="seafood">Seafood</button>
+            <button type="button" class="chip" data-value="sesame">Sesame</button>
+            <button type="button" class="chip" data-value="shellfish">Shellfish</button>
+            <button type="button" class="chip" data-value="soy">Soy</button>
+            <button type="button" class="chip" data-value="sulfite">Sulfite</button>
+            <button type="button" class="chip" data-value="tree nut">Tree Nut</button>
+            <button type="button" class="chip" data-value="wheat">Wheat</button>
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="primary-btn">Find recipes</button>
+    </form>
+
+    <div class="results-toolbar" id="results-toolbar" hidden>
+      <label for="sort-select">Sort by</label>
+      <select id="sort-select">
+        <option value="match">Best match</option>
+        <option value="missing">Fewest missing ingredients</option>
+      </select>
+    </div>
+
+    <div id="search-status" class="status-msg"></div>
+    <div id="results-grid" class="results-grid"></div>
+  </section>
+
+  <!-- SPICES TAB -->
+  <section id="tab-spices" class="tab-panel">
+    <p class="tab-desc">Check off the spices you already have on hand. These are automatically added to every search (see the checkbox on the Search tab).</p>
+    <div class="field">
+      <input type="text" id="new-spice-input" placeholder="Add a spice not in the list...">
+      <button type="button" id="add-spice-btn" class="secondary-btn">Add</button>
+    </div>
+    <div id="spice-grid" class="spice-grid"></div>
+  </section>
+
+  <!-- STAPLES TAB -->
+  <section id="tab-staples" class="tab-panel">
+    <p class="tab-desc">Staples are ingredients we assume you always have (salt, oil, water, etc). They're excluded from your "missing ingredients" list so recipes aren't unfairly penalized — but they'll still show up in full ingredient lists and instructions so you remember to use them.</p>
+    <div class="field">
+      <input type="text" id="new-staple-input" placeholder="Add a staple (e.g. soy sauce)">
+      <button type="button" id="add-staple-btn" class="secondary-btn">Add</button>
+    </div>
+    <ul id="staples-list" class="staples-list"></ul>
+  </section>
+
+  <!-- FAVORITES TAB -->
+  <section id="tab-favorites" class="tab-panel">
+    <div id="favorites-grid" class="results-grid"></div>
+    <p id="favorites-empty" class="status-msg" hidden>No saved recipes yet. Star a recipe from its detail view to save it here.</p>
+  </section>
+
+</main>
+
+<!-- RECIPE DETAIL MODAL -->
+<div id="recipe-modal" class="modal" hidden>
+  <div class="modal-content">
+    <button id="modal-close" class="modal-close">&times;</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
