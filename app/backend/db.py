@@ -7,7 +7,10 @@ since V1 is local-storage-only / single-user, no accounts yet):
   staples            - user-editable staples whitelist (spec 2.2.4)
   spices             - curated spice list + which ones the user owns (spec 2.3)
   favorites          - saved/favorited recipes (spec section 3)
-  nutrition_cache    - cache keyed by (recipe_id, servings) (spec 2.6.6)
+  exclusions         - "never show me X" ingredient list (spec 11.2), stored as
+                       names and resolved to recipe-DB ingredient IDs at search
+                       time so it survives recipe-DB rebuilds
+  nutrition_cache    - kept for Phase 4 Tier-2 computed nutrition (spec 11.4)
 """
 
 import sqlite3
@@ -22,8 +25,8 @@ DEFAULT_STAPLES = [
     "vegetable oil", "water", "sugar",
 ]
 
-# Curated spice list — Spoonacular doesn't expose a "spice" category flag,
-# so we maintain this ourselves (spec 2.3).
+# Curated spice list — no data source exposes a reliable "spice" category
+# flag, so we maintain this ourselves (spec 2.3).
 CURATED_SPICES = [
     "salt", "black pepper", "cayenne pepper", "paprika", "smoked paprika",
     "cumin", "coriander", "turmeric", "chili powder", "garlic powder",
@@ -66,6 +69,11 @@ def init_db():
                 title TEXT,
                 image TEXT,
                 saved_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS exclusions (
+                name TEXT PRIMARY KEY
             )
         """)
         conn.execute("""
@@ -138,6 +146,27 @@ def set_spice_owned(name, owned):
             "ON CONFLICT(name) DO UPDATE SET owned = excluded.owned",
             (name.strip().lower(), 1 if owned else 0),
         )
+
+
+# ---------- "Never show me X" exclusions (spec 11.2) ----------
+
+def list_exclusions():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT name FROM exclusions ORDER BY name").fetchall()
+        return [r["name"] for r in rows]
+
+
+def add_exclusion(name):
+    name = name.strip().lower()
+    if not name:
+        return
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO exclusions (name) VALUES (?)", (name,))
+
+
+def remove_exclusion(name):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM exclusions WHERE name = ?", (name.strip().lower(),))
 
 
 # ---------- Favorites ----------

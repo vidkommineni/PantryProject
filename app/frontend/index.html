@@ -13,6 +13,7 @@
     <button class="tab-btn active" data-tab="search">Search</button>
     <button class="tab-btn" data-tab="spices">Spice Inventory</button>
     <button class="tab-btn" data-tab="staples">Staples</button>
+    <button class="tab-btn" data-tab="exclusions">Exclusions</button>
     <button class="tab-btn" data-tab="favorites">Favorites</button>
   </nav>
 </header>
@@ -46,6 +47,17 @@
         </div>
         <div class="field checkbox-field">
           <label><input type="checkbox" id="use-spices" checked> Include my spice inventory</label>
+        </div>
+        <div class="field checkbox-field">
+          <label title="When on, entering a protein (chicken, salmon, tofu...) only shows recipes featuring that protein and no other. Turn off to allow recipes with additional proteins."><input type="checkbox" id="strict-protein" checked> Strict protein match</label>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="max-missing">Max missing ingredients: <span id="max-missing-value">2</span></label>
+          <input type="range" id="max-missing" min="0" max="4" step="1" value="2">
+          <small class="field-hint">Recipes needing more than this are collapsed under "show more". Staples and spices you own don't count as missing.</small>
         </div>
       </div>
 
@@ -86,11 +98,17 @@
       <select id="sort-select">
         <option value="match">Best match</option>
         <option value="missing">Fewest missing ingredients</option>
+        <option value="fastest">Fastest</option>
       </select>
     </div>
 
     <div id="search-status" class="status-msg"></div>
     <div id="results-grid" class="results-grid"></div>
+
+    <div id="overflow-section" hidden>
+      <button type="button" id="show-more-btn" class="secondary-btn show-more-btn"></button>
+      <div id="overflow-grid" class="results-grid" hidden></div>
+    </div>
   </section>
 
   <!-- SPICES TAB -->
@@ -111,6 +129,16 @@
       <button type="button" id="add-staple-btn" class="secondary-btn">Add</button>
     </div>
     <ul id="staples-list" class="staples-list"></ul>
+  </section>
+
+  <!-- EXCLUSIONS TAB (spec 11.2 "never show me X") -->
+  <section id="tab-exclusions" class="tab-panel">
+    <p class="tab-desc">Ingredients you never want to see — dislikes or allergies beyond the standard intolerance list. Any recipe containing one of these is excluded from every search, no matter how well it matches.</p>
+    <div class="field">
+      <input type="text" id="new-exclusion-input" placeholder="Never show me... (e.g. cilantro, olives)">
+      <button type="button" id="add-exclusion-btn" class="secondary-btn">Add</button>
+    </div>
+    <ul id="exclusions-list" class="staples-list"></ul>
   </section>
 
   <!-- FAVORITES TAB -->

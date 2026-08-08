@@ -1,0 +1,342 @@
+"""
+Shared ETL pieces (spec 10.3 / 10.4): schema DDL, diet-exclusion keyword sets,
+%DV -> absolute-unit conversion, and the vocabulary/index builders used both by
+the real Food.com pipeline (run_all.py) and the fixtures builder.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = REPO_ROOT / "data"
+BACKEND_DIR = REPO_ROOT / "app" / "backend"
+sys.path.insert(0, str(BACKEND_DIR))
+
+from normalize import normalize_ingredient, token_set  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Schema (spec 10.4)
+# ---------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS recipes (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    minutes INTEGER,
+    n_steps INTEGER,
+    steps_json TEXT,
+    description TEXT,
+    n_ingredients INTEGER,
+    raw_ingredients_json TEXT,
+    image_url TEXT,
+    default_servings INTEGER DEFAULT 1,
+    avg_rating REAL,
+    n_ratings INTEGER DEFAULT 0,
+    calories REAL,
+    macros_json TEXT,
+    diet_flags INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ingredients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name_canonical TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recipe_ingredients (
+    recipe_id INTEGER NOT NULL,
+    ingredient_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ri_ingredient ON recipe_ingredients (ingredient_id, recipe_id);
+CREATE INDEX IF NOT EXISTS idx_ri_recipe     ON recipe_ingredients (recipe_id, ingredient_id);
+CREATE TABLE IF NOT EXISTS ingredient_synonyms (
+    alias TEXT NOT NULL,
+    ingredient_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_syn_alias ON ingredient_synonyms (alias);
+CREATE TABLE IF NOT EXISTS diet_exclusions (
+    diet TEXT NOT NULL,
+    ingredient_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_de_diet ON diet_exclusions (diet, ingredient_id);
+CREATE INDEX IF NOT EXISTS idx_de_ing  ON diet_exclusions (ingredient_id);
+"""
+
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS ingredients_fts
+USING fts5(name_canonical, content='ingredients', content_rowid='id');
+"""
+
+
+def create_schema(conn):
+    conn.executescript(SCHEMA)
+    try:
+        conn.executescript(FTS_SCHEMA)
+    except Exception:
+        pass  # FTS5 unavailable -> autocomplete falls back to LIKE
+
+
+def rebuild_fts(conn):
+    try:
+        conn.execute("INSERT INTO ingredients_fts(ingredients_fts) VALUES('rebuild')")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 nutrition (spec 11.4): the "Recipes and Reviews" dataset ships
+# absolute per-serving values (grams / mg), so no %DV conversion is needed.
+# ---------------------------------------------------------------------------
+
+MACRO_KEYS = ["fat", "saturated_fat", "sugar", "sodium", "protein", "carbs",
+              "fiber", "cholesterol"]
+
+
+def build_macros(fat, satfat, sugar, sodium, protein, carbs, fiber, cholesterol):
+    def num(x):
+        try:
+            v = float(x)
+            return round(v, 1) if v == v else None  # NaN check
+        except (TypeError, ValueError):
+            return None
+    macros = {
+        "fat": num(fat), "saturated_fat": num(satfat), "sugar": num(sugar),
+        "sodium": num(sodium), "protein": num(protein), "carbs": num(carbs),
+        "fiber": num(fiber), "cholesterol": num(cholesterol),
+    }
+    return {k: v for k, v in macros.items() if v is not None}
+
+
+# ---------------------------------------------------------------------------
+# Dataset field parsing: R-style c("a", "b") vectors and ISO-8601 durations.
+# The parquet files store real arrays; the CSVs store R vector literals.
+# ---------------------------------------------------------------------------
+
+def parse_r_vector(value):
+    """R c("a", "b") string / real list / scalar -> list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v is not None]
+    if hasattr(value, "tolist"):  # numpy array from parquet
+        return [str(v) for v in value.tolist() if v is not None]
+    if isinstance(value, float):  # NaN
+        return []
+    s = str(value).strip()
+    if not s or s.upper() == "NA":
+        return []
+    if s.startswith("c(") and s.endswith(")"):
+        return re.findall(r'"((?:[^"\\]|\\.)*)"', s)
+    return [s.strip('"')]
+
+
+def parse_iso_duration_minutes(value):
+    """'PT1H30M' / 'P1DT2H' -> total minutes, or None."""
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    m = re.match(
+        r"^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:\d+S)?$", str(value).strip())
+    if not m or not any(m.groups()):
+        return None
+    days, hours, mins = (int(g) if g else 0 for g in m.groups())
+    return days * 24 * 60 + hours * 60 + mins
+
+
+# ---------------------------------------------------------------------------
+# Diet flags from tags (spec 10.3 step 4)
+# ---------------------------------------------------------------------------
+
+DIET_FLAG_BITS = {
+    "vegetarian": 1, "vegan": 2, "gluten-free": 4,
+    "dairy-free": 8, "low-carb": 16, "paleo": 32,
+}
+
+TAG_TO_DIET = {
+    "vegetarian": "vegetarian",
+    "vegan": "vegan",
+    "gluten-free": "gluten-free",
+    "gluten free": "gluten-free",
+    "lactose": "dairy-free",
+    "lactose free": "dairy-free",
+    "dairy-free": "dairy-free",
+    "dairy free": "dairy-free",
+    "low-carb": "low-carb",
+    "low carb": "low-carb",
+    "paleo": "paleo",
+}
+
+# Flag diet -> the diet_exclusions key used for the ingredient-scan-derived
+# flags (see derive_diet_flags.py). Keyword coverage varies by dataset, so a
+# recipe also earns a flag when its ingredient list is clean for that diet.
+FLAG_TO_EXCLUSION_KEY = {
+    "vegetarian": "vegetarian",
+    "vegan": "vegan",
+    "gluten-free": "gluten",
+    "dairy-free": "dairy",
+    "low-carb": "ketogenic",
+    "paleo": "paleo",
+}
+
+
+def diet_flags_from_tags(tags):
+    flags = 0
+    for tag in tags or []:
+        diet = TAG_TO_DIET.get(str(tag).strip().lower())
+        if diet:
+            flags |= DIET_FLAG_BITS[diet]
+    # vegan implies vegetarian + dairy-free
+    if flags & DIET_FLAG_BITS["vegan"]:
+        flags |= DIET_FLAG_BITS["vegetarian"] | DIET_FLAG_BITS["dairy-free"]
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# Exclusion keyword sets (spec 11.2), matched token-wise against the vocabulary
+# at ETL time so runtime filtering is a pure indexed anti-join.
+# A keyword hits an ingredient when every keyword token appears (singularized)
+# in the ingredient's token set — so "chicken" hits "chicken broth" (correct:
+# broth is NOT vegetarian) but never "chickpeas".
+# ---------------------------------------------------------------------------
+
+MEAT = [
+    "chicken", "beef", "pork", "lamb", "bacon", "ham", "turkey", "veal",
+    "duck", "goose", "venison", "sausage", "pepperoni", "prosciutto",
+    "salami", "chorizo", "meat", "meatball", "steak", "brisket", "ribs",
+    "hot dog", "gelatin", "lard", "liver", "oxtail", "pastrami",
+]
+FISH = [
+    "fish", "salmon", "tuna", "anchovy", "anchovies", "cod", "halibut",
+    "tilapia", "trout", "sardine", "haddock", "mackerel", "snapper",
+    "swordfish", "fish sauce", "worcestershire sauce",
+]
+SHELLFISH = [
+    "shrimp", "prawn", "crab", "lobster", "clam", "mussel", "oyster",
+    "scallop", "squid", "octopus", "crawfish", "oyster sauce",
+]
+DAIRY = [
+    "milk", "butter", "cheese", "cream", "yogurt", "ghee", "paneer",
+    "buttermilk", "custard", "ice cream", "sour cream", "whipping cream",
+    "heavy cream", "half-and-half", "parmesan", "mozzarella", "cheddar",
+    "feta", "ricotta", "mascarpone", "brie", "gouda", "condensed milk",
+    "evaporated milk", "whey", "cream cheese",
+]
+EGG = ["egg", "eggs", "mayonnaise", "meringue"]
+GLUTEN = [
+    "flour", "wheat", "bread", "breadcrumbs", "pasta", "spaghetti",
+    "macaroni", "penne", "fettuccine", "linguine", "lasagna", "couscous",
+    "barley", "rye", "semolina", "panko", "seitan", "cracker", "crackers",
+    "tortellini", "orzo", "gnocchi", "phyllo", "puff pastry", "pita",
+]
+PEANUT = ["peanut", "peanuts", "peanut butter", "peanut oil"]
+TREE_NUT = [
+    "almond", "walnut", "pecan", "cashew", "pistachio", "hazelnut",
+    "macadamia", "brazil nut", "pine nut", "chestnut", "nutella",
+]
+SOY = ["soy", "soybean", "tofu", "edamame", "tempeh", "miso", "soy sauce", "tamari"]
+SESAME = ["sesame", "tahini", "sesame oil", "sesame seed"]
+SULFITE = ["wine", "dried apricot", "molasses", "sauerkraut", "grape juice"]
+HIGH_CARB = [
+    "sugar", "flour", "bread", "pasta", "rice", "potato", "potatoes",
+    "corn", "honey", "oats", "oatmeal", "tortilla", "maple syrup",
+]
+LEGUMES_GRAINS_DAIRY = DAIRY + GLUTEN + [
+    "rice", "oats", "corn", "beans", "lentils", "chickpeas", "peanut",
+    "tofu", "soy", "sugar",
+]
+
+# diet/intolerance name -> keyword list. Diet names match the UI chips;
+# intolerance names match the intolerance chips.
+EXCLUSION_KEYWORDS = {
+    "vegetarian": MEAT + FISH + SHELLFISH,
+    "vegan": MEAT + FISH + SHELLFISH + DAIRY + EGG + ["honey"],
+    "pescetarian": MEAT,
+    "ketogenic": HIGH_CARB,
+    "paleo": LEGUMES_GRAINS_DAIRY,
+    # intolerances (spec 2.1)
+    "dairy": DAIRY,
+    "egg": EGG,
+    "gluten": GLUTEN,
+    "wheat": GLUTEN,
+    "peanut": PEANUT,
+    "tree nut": TREE_NUT,
+    "seafood": FISH + SHELLFISH,
+    "shellfish": SHELLFISH,
+    "soy": SOY,
+    "sesame": SESAME,
+    "sulfite": SULFITE,
+}
+
+
+def keyword_hits(keyword, ingredient_name):
+    """Token-subset match: every keyword token present in the ingredient name."""
+    kw_tokens = token_set(keyword)
+    return bool(kw_tokens) and kw_tokens <= token_set(ingredient_name)
+
+
+def build_diet_exclusions(conn):
+    """Spec 10.3 step 4 (second half): map keyword sets to vocabulary IDs."""
+    conn.execute("DELETE FROM diet_exclusions")
+    vocab = conn.execute("SELECT id, name_canonical FROM ingredients").fetchall()
+    rows = []
+    for diet, keywords in EXCLUSION_KEYWORDS.items():
+        for ing_id, name in vocab:
+            if any(keyword_hits(kw, name) for kw in keywords):
+                rows.append((diet, ing_id))
+    conn.executemany("INSERT INTO diet_exclusions (diet, ingredient_id) VALUES (?, ?)", rows)
+    return len(rows)
+
+
+def build_synonyms(conn):
+    """Seed ingredient_synonyms from the normalize.py dictionary, mapped to
+    whatever canonical names actually exist in this DB's vocabulary."""
+    from normalize import INGREDIENT_SYNONYMS
+    conn.execute("DELETE FROM ingredient_synonyms")
+    name_to_id = {
+        r[1]: r[0]
+        for r in conn.execute("SELECT id, name_canonical FROM ingredients").fetchall()
+    }
+    rows = []
+    for alias, canonical in INGREDIENT_SYNONYMS.items():
+        ing_id = name_to_id.get(canonical)
+        if ing_id:
+            rows.append((alias, ing_id))
+    conn.executemany("INSERT INTO ingredient_synonyms (alias, ingredient_id) VALUES (?, ?)", rows)
+    return len(rows)
+
+
+def parse_stringified_list(value):
+    """Food.com CSVs store Python-list literals as strings; parse defensively."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        import ast
+        parsed = ast.literal_eval(value)
+        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+    except (ValueError, SyntaxError):
+        return [s for s in re.split(r"[,;]", value.strip("[]")) if s.strip()]
+
+
+def insert_recipe_ingredients(conn, recipe_id, raw_ingredient_names):
+    """Normalize (7.2) each raw name, upsert into the vocabulary, and write the
+    inverted index rows. Returns the ingredient IDs used."""
+    ids = []
+    seen = set()
+    for raw in raw_ingredient_names:
+        canonical = normalize_ingredient(raw)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO ingredients (name_canonical) VALUES (?)", (canonical,))
+        row = conn.execute(
+            "SELECT id FROM ingredients WHERE name_canonical = ?", (canonical,)).fetchone()
+        ids.append(row[0])
+    conn.executemany(
+        "INSERT INTO recipe_ingredients (recipe_id, ingredient_id) VALUES (?, ?)",
+        [(recipe_id, i) for i in ids])
+    return ids
+
+
+def dumps(obj):
+    return json.dumps(obj, ensure_ascii=False)

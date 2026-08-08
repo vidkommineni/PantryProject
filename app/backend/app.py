@@ -1,23 +1,27 @@
 """
-Flask app for "What's In My Pantry" V1.
+Flask app for "What's In My Pantry" — V3: fully local architecture.
 
-Serves the static frontend and exposes the JSON API it calls. Run with:
+No external API calls: recipes come from the local SQLite database built by
+etl/run_all.py (Food.com dataset), with the checked-in data/fixtures.db as an
+out-of-the-box fallback. Spoonacular is retired (spec Part III).
+
+Run with:
     python app.py
 Then open http://localhost:5000 in a browser.
-
-See README.md at the project root for setup (API keys, install steps).
 """
 
 import os
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).parent / ".env")
 
 import db
-import pantry_api_client as api
+import nutrition
+import recipe_store
+import roles
+import search as search_engine
+from normalize import normalize_ingredients
+from quantities import scale_quantity
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
@@ -75,7 +79,29 @@ def toggle_spice():
     return jsonify({"spices": db.list_spices()})
 
 
-# ---------- Ingredient autocomplete (spec 2.1) ----------
+# ---------- "Never show me X" exclusions (spec 11.2) ----------
+
+@app.route("/api/exclusions", methods=["GET"])
+def get_exclusions():
+    return jsonify({"exclusions": db.list_exclusions()})
+
+
+@app.route("/api/exclusions", methods=["POST"])
+def post_exclusion():
+    name = (request.json or {}).get("name", "")
+    if not name.strip():
+        return error_response("Missing 'name'", 400)
+    db.add_exclusion(name)
+    return jsonify({"exclusions": db.list_exclusions()})
+
+
+@app.route("/api/exclusions/<name>", methods=["DELETE"])
+def delete_exclusion(name):
+    db.remove_exclusion(name)
+    return jsonify({"exclusions": db.list_exclusions()})
+
+
+# ---------- Ingredient autocomplete (spec 11.3, local FTS5) ----------
 
 @app.route("/api/autocomplete", methods=["GET"])
 def autocomplete():
@@ -83,15 +109,12 @@ def autocomplete():
     if not query:
         return jsonify({"suggestions": []})
     try:
-        results = api.autocomplete_ingredient(query)
-    except api.ApiKeyMissingError as e:
-        return error_response(e, 400)
-    except Exception as e:
-        return error_response(e)
-    return jsonify({"suggestions": results})
+        return jsonify({"suggestions": recipe_store.autocomplete(query)})
+    except recipe_store.RecipeDbMissingError as e:
+        return error_response(e, 500)
 
 
-# ---------- Search (spec 2.2, 2.3, 2.5, section 3) ----------
+# ---------- Search (spec 11.1 + 11.2 + 7.1/7.3/7.4) ----------
 
 @app.route("/api/search", methods=["POST"])
 def search():
@@ -99,9 +122,16 @@ def search():
     ingredients = body.get("ingredients", [])
     servings = int(body.get("servings", 4))
     max_ready_time = body.get("maxReadyTime")
-    diet = body.get("diet", [])
+    diets = body.get("diet", [])
     intolerances = body.get("intolerances", [])
     use_spices = body.get("useSpiceInventory", True)
+    strict_protein = bool(body.get("strictProtein", True))
+    strategy = body.get("sort") or search_engine.DEFAULT_RANKING
+    try:
+        max_missing = int(body.get("maxMissing", search_engine.DEFAULT_MAX_MISSING))
+    except (TypeError, ValueError):
+        max_missing = search_engine.DEFAULT_MAX_MISSING
+    max_missing = max(0, min(4, max_missing))
 
     if not ingredients:
         return error_response("Provide at least one ingredient.", 400)
@@ -110,152 +140,173 @@ def search():
     staples = db.list_staples()
 
     try:
-        if diet or intolerances or max_ready_time:
-            raw_by_id = {}
-            for r in api.search_recipes_by_ingredients(ingredients, spice_inventory):
-                raw_by_id[r["id"]] = r
-            for r in api.search_recipes_complex(
-                ingredients, spice_inventory,
-                diet=diet, intolerances=intolerances,
-                max_ready_time=max_ready_time,
-            ):
-                raw_by_id.setdefault(r["id"], r)
-            for r in api.search_recipes_by_query(
-                ingredients, spice_inventory,
-                diet=diet, intolerances=intolerances,
-                max_ready_time=max_ready_time,
-            ):
-                raw_by_id.setdefault(r["id"], r)
-            raw_results = list(raw_by_id.values())
-            # complexSearch (fillIngredients) doesn't return used/missed counts the
-            # same way findByIngredients does, so normalize a lighter-weight shape.
-            results = []
-            for r in raw_results:
-                missed = r.get("missedIngredients", [])
-                used = r.get("usedIngredients", [])
-                recipe = {
-                    "id": r["id"],
-                    "title": r["title"],
-                    "image": r.get("image"),
-                    "usedIngredientCount": len(used),
-                    "missedIngredientCount": len(filter_visible_missing(missed, staples)),
-                    "missedIngredients": filter_visible_missing(missed, staples),
-                    "usedIngredients": used,
-                }
-                recipe.update(api.score_recipe_match(recipe, ingredients, spice_inventory, staples))
-                results.append(recipe)
+        # 7.2: normalize user terms; 2.3: merge owned spices into the query so a
+        # recipe needing a spice the user has isn't counted as missing it.
+        # Staples are NOT injected (2.2.2).
+        # User-entered ingredients and spice-inventory terms are resolved
+        # separately so scoring can prioritize the food the user actually
+        # typed over incidental spice matches.
+        user_terms = normalize_ingredients(ingredients)
+        spice_terms = [t for t in normalize_ingredients(spice_inventory)
+                       if t not in user_terms]
+        user_term_ids = recipe_store.resolve_terms(user_terms)
+        user_ids = set().union(*user_term_ids.values()) if user_term_ids else set()
+        spice_term_ids = recipe_store.resolve_terms(spice_terms)
+        spice_ids = (set().union(*spice_term_ids.values()) if spice_term_ids else set()) - user_ids
+        matched_ids = user_ids | spice_ids
+
+        # 11.2: user exclusions are hard filters applied before scoring.
+        excluded_ids = set()
+        for excl in db.list_exclusions():
+            excluded_ids |= recipe_store.resolve_term_ids(excl)
+
+        candidates = recipe_store.fetch_candidates(
+            matched_ids,
+            diets=diets,
+            intolerances=intolerances,
+            max_minutes=max_ready_time,
+            excluded_ingredient_ids=excluded_ids,
+            limit=search_engine.DEFAULT_CANDIDATE_COUNT,
+        )
+    except recipe_store.RecipeDbMissingError as e:
+        return error_response(e, 500)
+
+    # 15.2 — anchor hard filter, applied before scoring like the 11.2
+    # exclusions: entering "chicken" means chicken recipes only; a recipe
+    # anchored on a different protein (pork, shrimp, ...) must never appear,
+    # regardless of how well its other ingredients match.
+    user_anchor_fams = roles.anchor_families(ingredients)
+    candidates = roles.filter_candidates_by_anchor(
+        candidates, user_anchor_fams, allow_extra_anchors=not strict_protein)
+
+    results = []
+    for c in candidates:
+        # Tag each match: core = matched a user-entered ingredient;
+        # supporting = matched only via the spice inventory.
+        for ing in c["usedIngredients"]:
+            ing["core"] = ing.get("id") in user_ids
+        core_used = search_engine.core_used_count(c["usedIngredients"])
+        # A recipe that matches none of the user's actual ingredients is a
+        # seasoning-only hit — never show it (unless the user typed only spices).
+        if user_ids and core_used == 0:
+            continue
+        visible_missing = search_engine.visible_missing(c["missedIngredients"], staples)
+        recipe = {
+            "id": c["id"],
+            "title": c["title"],
+            "image": c.get("imageUrl"),
+            "minutes": c.get("minutes"),
+            "readyInMinutes": c.get("minutes"),
+            "avgRating": c.get("avgRating"),
+            "nRatings": c.get("nRatings"),
+            "usedIngredientCount": len(c["usedIngredients"]),
+            "missedIngredientCount": len(visible_missing),
+            "usedIngredients": c["usedIngredients"],
+            "missedIngredients": visible_missing,
+        }
+        total = recipe["usedIngredientCount"] + recipe["missedIngredientCount"]
+        recipe["matchPercent"] = round(100 * recipe["usedIngredientCount"] / total) if total else 0
+        recipe["isFavorite"] = db.is_favorite(recipe["id"])
+        results.append(recipe)
+
+    # 7.3 re-ranking with the 7.1 server-side strategy toggle.
+    results = search_engine.rerank_results(
+        results, spice_inventory, staples, strategy=strategy)
+
+    # 7.4 — strong matches first; weaker ones collapse behind "show more".
+    primary, overflow = search_engine.filter_by_missing_count(
+        results, max_missing, spice_inventory, staples)
+    primary = primary[:10]
+    overflow = overflow[:10]
+
+    if not primary and not overflow:
+        if user_anchor_fams:
+            fams = ", ".join(sorted(user_anchor_fams))
+            message = (f"No recipes found featuring {fams} with your other "
+                       "ingredients. Try adding a supporting ingredient "
+                       "(an aromatic, a grain), raising the \"max missing\" "
+                       "slider, or broadening your filters.")
         else:
-            raw_results = api.search_recipes_by_ingredients(ingredients, spice_inventory)
-            results = []
-            for r in raw_results:
-                missed = r.get("missedIngredients", [])
-                recipe = {
-                    "id": r["id"],
-                    "title": r["title"],
-                    "image": r.get("image"),
-                    "usedIngredientCount": r.get("usedIngredientCount", 0),
-                    "missedIngredientCount": len(filter_visible_missing(missed, staples)),
-                    "missedIngredients": filter_visible_missing(missed, staples),
-                    "usedIngredients": r.get("usedIngredients", []),
-                }
-                recipe.update(api.score_recipe_match(recipe, ingredients, spice_inventory, staples))
-                results.append(recipe)
-    except api.ApiKeyMissingError as e:
-        return error_response(e, 400)
-    except Exception as e:
-        return error_response(e)
-
-    # Match percentage badge (spec section 3)
-    for r in results:
-        total = r["usedIngredientCount"] + r["missedIngredientCount"]
-        r["matchPercent"] = round(100 * r["usedIngredientCount"] / total) if total else 0
-        r["isFavorite"] = db.is_favorite(r["id"])
-    results.sort(
-        key=lambda r: (
-            r.get("score", 0),
-            -r.get("anchorIngredientMissCount", 0),
-            -r.get("requestedCoreMissCount", 0),
-            r.get("coreMatchPercent", 0),
-            -r.get("missedCoreIngredientCount", 0),
-            r.get("matchPercent", 0),
-        ),
-        reverse=True,
-    )
-    results = results[:10]
-
-    if not results:
+            message = ("No recipes matched. Try broadening your filters, "
+                       "adding a spice you have on hand, or removing a "
+                       "dietary restriction.")
         return jsonify({
-            "results": [],
+            "results": [], "overflowResults": [], "maxMissing": max_missing,
+            "emptyState": {"message": message},
+        })
+    if not primary:
+        return jsonify({
+            "results": [], "overflowResults": overflow, "maxMissing": max_missing,
             "emptyState": {
-                "message": "No recipes matched. Try broadening your filters, "
-                            "adding a spice you have on hand, or removing a dietary restriction.",
+                "message": f"No recipes with {max_missing} or fewer missing ingredients. "
+                           "Showing the closest matches below — raise the "
+                           "\"max missing\" slider to see more.",
             },
         })
-
-    return jsonify({"results": results})
-
-
-def filter_visible_missing(missed_ingredients, staples):
-    return api.filter_staples(missed_ingredients, staples)
+    return jsonify({"results": primary, "overflowResults": overflow,
+                    "maxMissing": max_missing, "servings": servings})
 
 
-# ---------- Recipe detail + scaling (spec 2.4, 2.5) ----------
+# ---------- Recipe detail (spec 2.4, 2.5) ----------
 
 @app.route("/api/recipe/<int:recipe_id>", methods=["GET"])
 def recipe_detail(recipe_id):
     servings = int(request.args.get("servings", 4))
     try:
-        info = api.get_recipe_information(recipe_id)
-    except api.ApiKeyMissingError as e:
-        return error_response(e, 400)
-    except Exception as e:
-        return error_response(e)
+        recipe = recipe_store.get_recipe(recipe_id)
+    except recipe_store.RecipeDbMissingError as e:
+        return error_response(e, 500)
+    if recipe is None:
+        return error_response("Recipe not found.", 404)
 
-    default_servings = info.get("servings", 1)
-    scaled = api.scale_ingredients(info.get("extendedIngredients", []), servings, default_servings)
+    # Spec 2.5 — scale ingredient quantities client-agnostically on the server:
+    # factor = desiredServings / defaultServings.
+    default_servings = recipe.get("default_servings") or 1
+    factor = servings / default_servings
+    scaled = []
+    for ing in recipe.get("display_ingredients", []):
+        scaled.append({
+            "name": ing["name"],
+            "amount": ing.get("amount"),
+            "scaledAmount": scale_quantity(ing.get("amount"), factor),
+        })
 
     return jsonify({
-        "id": info.get("id"),
-        "title": info.get("title"),
-        "image": info.get("image"),
-        "readyInMinutes": info.get("readyInMinutes"),
-        "sourceUrl": info.get("sourceUrl"),
-        "instructions": info.get("instructions"),
-        "analyzedInstructions": info.get("analyzedInstructions", []),
+        "id": recipe["id"],
+        "title": recipe["name"],
+        "image": recipe.get("image_url"),
+        "readyInMinutes": recipe.get("minutes"),
+        "description": recipe.get("description") or "",
+        "sourceUrl": f"https://www.food.com/recipe/{recipe['id']}",
+        "steps": recipe.get("steps", []),
         "defaultServings": default_servings,
         "requestedServings": servings,
         "scaledIngredients": scaled,
+        "avgRating": recipe.get("avg_rating"),
+        "nRatings": recipe.get("n_ratings"),
         "isFavorite": db.is_favorite(recipe_id),
     })
 
 
-# ---------- Nutrition via Spoonacular ----------
+# ---------- Nutrition — Tier 1, local (spec 11.4, implements 2.6) ----------
 
 @app.route("/api/recipe/<int:recipe_id>/nutrition", methods=["POST"])
 def recipe_nutrition(recipe_id):
     body = request.json or {}
     servings = int(body.get("servings", 4))
-
-    cached = db.get_cached_nutrition(recipe_id, servings)
-    # Ignore entries created by the former nutrition provider. Spoonacular
-    # entries use the normalized `nutrients` list and headline nutrient keys.
-    if cached and "nutrients" in cached:
-        cached["cached"] = True
-        return jsonify(cached)
-
     try:
-        nutrition = api.get_recipe_nutrition(recipe_id)
-        nutrition["cached"] = False
-    except api.ApiKeyMissingError as e:
-        return error_response(e, 400)
-    except Exception as e:
-        return jsonify({
-            "error": f"Nutrition lookup failed: {e}",
-            "cached": False,
-        }), 200
+        per_serving = recipe_store.get_nutrition(recipe_id)
+    except recipe_store.RecipeDbMissingError as e:
+        return error_response(e, 500)
+    if per_serving is None:
+        return jsonify({"error": "No nutrition data for this recipe."}), 200
+    # Tier-1 values are a single indexed read — no cache needed. The
+    # RecipeNutritionCache table returns in Phase 4 for computed Tier-2 values.
+    payload = nutrition.build_payload(per_serving, servings)
+    payload["cached"] = False
+    return jsonify(payload)
 
-    db.cache_nutrition(recipe_id, servings, nutrition)
-    return jsonify(nutrition)
+
 # ---------- Favorites (spec section 3) ----------
 
 @app.route("/api/favorites", methods=["GET"])

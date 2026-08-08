@@ -1,3 +1,12 @@
+# V3 — fully local architecture (spec Part III). No API keys, no quotas,
+# no external HTTP at runtime.
 flask==3.0.3
-requests==2.32.3
-python-dotenv==1.0.1
+
+# V2 (spec 8) — unit tests for the pure functions.
+pytest==8.3.3
+
+# Optional: typo-tolerant autocomplete fallback (spec 11.3).
+rapidfuzz>=3.0
+
+# ETL only (spec 10.3) — needed just to build data/pantry.db once:
+#   pip install pandas kagglehub
