@@ -23,26 +23,38 @@ body {
 .topbar {
   background: var(--green);
   color: white;
-  padding: 16px 24px;
-  display: flex;
+  padding: 14px 24px;
+  display: grid;
+  grid-template-columns: auto 1fr;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
+  column-gap: 24px;
+  row-gap: 14px;
 }
 
-.topbar h1 { font-size: 1.25rem; margin: 0; }
+.topbar h1 {
+  font-size: 1.75rem;
+  font-weight: 800;
+  margin: 0;
+  white-space: nowrap;
+}
 
-.tabs { display: flex; gap: 6px; }
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
 
 .tab-btn {
   background: transparent;
   border: 1px solid rgba(255,255,255,0.4);
   color: white;
-  padding: 6px 14px;
+  padding: 8px 18px;
   border-radius: 999px;
   cursor: pointer;
-  font-size: 0.85rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .tab-btn.active { background: white; color: var(--green-dark); font-weight: 600; }
@@ -349,4 +361,15 @@ input[type="range"]#max-missing {
 
 #overflow-grid {
   opacity: 0.85;
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+
+  .tabs {
+    width: 100%;
+  }
 }
