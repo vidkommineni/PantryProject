@@ -1,8 +1,8 @@
-# What's In My Pantry (V3 — fully local)
+# What's In My Pantry (V4 — fully local)
 
-An app that takes the ingredients you have on hand and returns recipes you can actually cook. **V3 runs entirely on your own machine — zero external API calls, no quotas, no keys.** Recipes come from the Kaggle **"Food.com Recipes and Reviews"** dataset (~500K recipes, with ingredient quantities, serving counts, per-serving nutrition, ratings, and image URLs) loaded into SQLite; Spoonacular is retired (spec Part III).
+An app that takes the ingredients you have on hand and returns recipes you can actually cook. **V4 runs entirely on your own machine — zero external API calls, no quotas, no keys.** Recipes come from the Kaggle **"Food.com Recipes and Reviews"** dataset (~500K recipes, with ingredient quantities, serving counts, per-serving nutrition, ratings, and image URLs) loaded into SQLite; Spoonacular is retired (spec Part III).
 
-Local-storage-only (SQLite files, single user, no accounts) and text-entry only. See the Context spec (`whats-in-my-pantry-spec-v3.md`) for the full feature spec and version history.
+Local-storage-only (SQLite files, single user, no accounts) and text-entry only. See the Context specs (`../files/whats-in-my-pantry-spec-v3.md` and `../files/whats-in-my-pantry-spec-v4-addendum.md`) for the full feature spec and version history.
 
 ## Stack
 
@@ -69,9 +69,15 @@ That's the whole table now — no API keys, no cache toggles, no mock mode. The 
 - **Tier-1 nutrition** (spec 11.4): dataset per-recipe values. (Tier 2 — USDA FDC per-ingredient computation — is Phase 4, not yet built; `nutrition_cache` table is kept for it.)
 - **Ratings as ranking signal** (spec 14): avg rating + count shown on cards and used as tie-breaker.
 
+### V4 — anchor-ingredient matching (spec section 15)
+- **Strict protein match**: when a user enters an anchor ingredient such as chicken, salmon, tofu, or protein powder, search applies a hard filter before scoring so results must feature that protein family.
+- **No protein leakage by default**: a chicken search will not return pork, shrimp, or anchor-free recipes just because the side ingredients match well. The UI includes a "Strict protein match" checkbox; turning it off allows recipes with additional proteins.
+- **Derivative ingredients are handled safely**: chicken broth, fish sauce, bacon bits, and similar flavor-base ingredients do not satisfy or trigger protein anchors.
+- **Regression coverage**: V4 tests cover chicken-not-pork behavior, whey protein normalization, broth edge cases, strict/relaxed protein mode, and multi-anchor searches.
+
 ## Not yet implemented
 
-- Phase 4: USDA FDC Tier-2 nutrition (spec 10.3 steps 5–6, 11.4)
+- USDA FDC Tier-2 nutrition (spec 10.3 steps 5–6, 11.4)
 - Phase 5: live pantry inventory with auto-depletion, receipt OCR, fridge-photo vision
 
 ## API endpoints
@@ -99,22 +105,23 @@ Request body:
   "diet": ["vegetarian"],
   "intolerances": ["dairy"],
   "useSpiceInventory": true,
+  "strictProtein": true,
   "maxMissing": 2,
   "sort": "match"
 }
 ```
 
-`sort` is one of `match` / `missing` / `fastest` (spec 7.1). Response: `results` (strong matches) and `overflowResults` (behind "show more"), both re-ranked (7.3) then split by the max-missing threshold (7.4). Matches are tagged core (user-typed ingredient) vs. supporting (spice inventory); supporting matches earn reduced score credit and seasoning-only recipes are dropped.
+`sort` is one of `match` / `missing` / `fastest` (spec 7.1). `strictProtein` defaults to `true`; when enabled, anchor ingredients are hard-filtered before scoring (spec 15.2). Response: `results` (strong matches) and `overflowResults` (behind "show more"), both re-ranked (7.3) then split by the max-missing threshold (7.4). Matches are tagged core (user-typed ingredient) vs. supporting (spice inventory); supporting matches earn reduced score credit and seasoning-only recipes are dropped.
 
 ## Tests
 
-48 tests, no network, no full DB required — pure functions plus the checked-in 50-recipe fixture DB (spec section 8):
+90 tests, no network, no full DB required — pure functions plus the checked-in 50-recipe fixture DB (spec section 8):
 
 ```bash
 python -m pytest tests/        # from the project root
 ```
 
-Includes the spec 11.2 regression cases: "chickpeas + vegetarian" returns no meat; "chicken" never matches recipes that merely contain chicken broth.
+Includes the spec 11.2 regression cases: "chickpeas + vegetarian" returns no meat; "chicken" never matches recipes that merely contain chicken broth. Also includes the V4 spec 15 anchor-matching regressions: chicken never returns pork, strict protein matching excludes extra proteins, and whey protein resolves to the protein-powder family.
 
 Rebuild the fixture DB after schema changes with `python etl/build_fixtures.py`.
 
@@ -123,12 +130,13 @@ Rebuild the fixture DB after schema changes with `python etl/build_fixtures.py`.
 ```
 PantryProject/
 ├── app/
-│   ├── README.md              # this file
+│   ├── TECHNICAL_NOTES.md     # detailed implementation notes
 │   ├── backend/
 │   │   ├── app.py             # Flask routes
 │   │   ├── recipe_store.py    # local recipe DB access (11.1/11.2/11.3)
 │   │   ├── search.py          # pure scoring/ranking (7.3/7.4)
 │   │   ├── normalize.py       # ingredient normalization (7.2) + matching rule
+│   │   ├── roles.py           # anchor/protein-family hard filters (15)
 │   │   ├── nutrition.py       # Tier-1 nutrition payloads (11.4)
 │   │   ├── db.py              # user-prefs SQLite (staples/spices/favorites/exclusions)
 │   │   └── requirements.txt
@@ -145,6 +153,8 @@ PantryProject/
 │   └── pantry.db              # built by ETL (gitignored)
 └── tests/
     ├── test_pure_functions.py
+    ├── test_quantities.py
+    ├── test_anchor_matching.py
     └── test_local_db.py
 ```
 
