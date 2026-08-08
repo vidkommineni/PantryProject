@@ -114,6 +114,20 @@ class TestDietEnforcement:
         assert "shrimp fried rice" not in _titles(results)
         assert "egg fried rice" in _titles(results)
 
+    def test_name_based_exclusion_catches_corrupted_ingredient_row(self):
+        # Regression: some dataset rows have their real ingredient list
+        # truncated so the disqualifying ingredient never made it into
+        # recipe_ingredients ("curried shrimp surprise" has no "shrimp" in
+        # its parsed ingredients, only in its title). The ingredient-based
+        # anti-join can't see it; the name-based one must still catch it.
+        results = _search(["onion", "curry powder", "sour cream"], diets=["vegetarian"])
+        assert "curried shrimp surprise" not in _titles(results)
+
+    def test_name_based_exclusion_does_not_block_plain_search(self):
+        # Without a diet filter, the recipe should still be findable.
+        results = _search(["onion", "curry powder", "sour cream"])
+        assert "curried shrimp surprise" in _titles(results)
+
 
 class TestUserExclusions:
     def test_never_show_me_x_is_hard_filter(self):

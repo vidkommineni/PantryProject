@@ -11,7 +11,9 @@ REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO / "app" / "backend"))
 sys.path.insert(0, str(REPO / "etl"))
 
-from quantities import parse_quantity, format_quantity, scale_quantity  # noqa: E402
+from quantities import (  # noqa: E402
+    parse_quantity, format_quantity, scale_quantity, format_scaled_ingredient,
+)
 from common import parse_r_vector, parse_iso_duration_minutes  # noqa: E402
 
 
@@ -76,6 +78,52 @@ class TestScaleQuantity:
 
     def test_identity(self):
         assert scale_quantity("3/4", 1.0) == "3/4"
+
+
+class TestFormatScaledIngredient:
+    """Cook-friendly, name-aware quantity display (recipe-usability feedback:
+    "1 1/3 chicken breasts" / "1 1/3 onions" aren't followable)."""
+
+    def test_protein_converts_to_weight(self):
+        # 1 chicken breast scaled 4/3 -> ~227g, kept with a rounded piece count.
+        out = format_scaled_ingredient("chicken breasts", "1", Fraction(4, 3))
+        assert out == "225 g (about 1 1/2)"
+
+    def test_protein_large_amount_uses_pounds(self):
+        out = format_scaled_ingredient("chicken breasts", "6", 1.0)
+        assert out.endswith("lb (about 6)")
+
+    def test_descriptor_stripped_before_matching(self):
+        out = format_scaled_ingredient("boneless skinless chicken breasts", "1", Fraction(4, 3))
+        assert "g (about" in out
+
+    def test_whole_produce_rounds_to_half_not_thirds(self):
+        # 1 onion scaled 4/3 -> 1 1/3 raw, rounds to the nearest half.
+        assert format_scaled_ingredient("onions", "1", Fraction(4, 3)) == "1 1/2"
+
+    def test_small_discrete_item_rounds_to_whole(self):
+        assert format_scaled_ingredient("garlic", "4", Fraction(2, 3)) == "3"
+        assert format_scaled_ingredient("eggs", "1", Fraction(1, 3)) == "1"  # never rounds to 0
+
+    def test_unit_text_left_alone(self):
+        # Already has a real unit -> trust it, don't reinterpret as a piece count.
+        out = format_scaled_ingredient("chicken breast", "2 lb", 1.5)
+        assert out == "3 lb"
+
+    def test_spice_unaffected(self):
+        assert format_scaled_ingredient("turmeric", "1/3", 2.0) == "2/3"
+
+    def test_unparseable_passes_through(self):
+        assert format_scaled_ingredient("salt", "a pinch", 2.0) == "a pinch"
+
+    def test_bare_pasta_count_converts_to_grams_and_cups(self):
+        # "2 pasta" isn't a real unit — dry pasta is measured by weight, and
+        # in cups rather than a bare piece count.
+        assert format_scaled_ingredient("pasta", "2", 1.0) == "170 g (about 1 1/2 cups)"
+        assert format_scaled_ingredient("spaghetti", "1", 1.0) == "85 g (about 3/4 cup)"
+
+    def test_bare_rice_count_converts_to_grams_and_cups(self):
+        assert format_scaled_ingredient("rice", "1", 1.0) == "90 g (about 1/2 cup)"
 
 
 class TestEtlParsers:

@@ -69,6 +69,52 @@ That's the whole table now — no API keys, no cache toggles, no mock mode. The 
 - **Tier-1 nutrition** (spec 11.4): dataset per-recipe values. (Tier 2 — USDA FDC per-ingredient computation — is Phase 4, not yet built; `nutrition_cache` table is kept for it.)
 - **Ratings as ranking signal** (spec 14): avg rating + count shown on cards and used as tie-breaker.
 
+### V4.1 — recipe-quality cleanup
+The raw Kaggle dump has real quality problems that V3/V4 didn't address: unescaped
+HTML entities in titles/steps/descriptions ("Quiche &aacute; Lorrie"), ~9K
+prep-tip / single-ingredient non-recipes ("Roasting Peppers", "Cafe Latte"),
+numbered near-duplicate recipes ("Sourdough Starter #1".."#6"), and — the
+biggest ranking problem — 47% of recipes with zero ratings plus a naive
+`avg_rating` tie-breaker that let a single 5-star rating outrank a recipe
+with hundreds of 4.6-star ratings. Fixed in `etl/common.py` / `etl/load_recipes.py`:
+- **HTML-entity decoding**: `html.unescape` on name/description/steps/ingredients at load time.
+- **Junk filter**: recipes need ≥2 real ingredients to load (drops prep-tip rows).
+- **Dedup pass** (`dedupe_recipes`): collapses same-name-stem + same-ingredient-set
+  duplicates, keeping whichever copy has the most ratings.
+- **Bayesian `quality_score`** (`apply_quality_scores`): `(v·R + m·C) / (v + m)`
+  (v=n_ratings, R=avg_rating, C=dataset mean, m=5-rating prior) replaces raw
+  `avg_rating` as the ranking tie-breaker in `search.py`'s `_key_best_match`,
+  and is now selected in `recipe_store.fetch_candidates`. Unrated recipes settle
+  at the dataset average instead of at the very top or bottom.
+Rerun `python etl/run_all.py` (or `etl/build_fixtures.py` for the fixture DB) to apply.
+
+### V4.2 — measurability, nutrition trust, and a diet-filter leak
+Three more real-world reports, fixed in `quantities.py`, `nutrition.py`, and
+`common.py`/`recipe_store.py`:
+- **Unmeasurable quantities**: proteins now convert to grams/lb instead of
+  "1 1/3 chicken breasts" (`quantities.WEIGHT_PER_UNIT_G`, includes dry pasta —
+  "2 pasta" -> "170 g (about 2)"); whole produce/aromatics round to halves
+  instead of raw thirds/eighths (`ROUND_TO_HALF_TOKENS`); small discrete items
+  (garlic, egg) round to whole counts (`ROUND_TO_WHOLE_TOKENS`). Anything with
+  its own unit already ("2 cups", "1 lb") is left alone.
+- **Nutrition plausibility guard**: a meaningful slice of the dataset's
+  self-reported per-serving nutrition is simply wrong (e.g. a tomato-pasta
+  sauce claiming 1225 kcal / 45g protein with no protein-bearing ingredient in
+  sight). `nutrition.plausibility_caveat` flags extreme calories or protein
+  grams unsupported by any recognized protein-source ingredient; the API
+  response carries a `caveat` string and the UI shows a warning instead of
+  presenting the number as fact.
+- **Diet-filter leak (shrimp/prawns through "vegetarian")**: some Food.com rows
+  have a corrupted `RecipeIngredientParts` array that drops the very
+  ingredient the title promises ("Curried Shrimp" with no "shrimp" in its
+  parsed ingredients), or a bogus self-reported "vegetarian" keyword tag. The
+  ingredient-based `diet_exclusions` anti-join and the tag-derived flag both
+  miss these. Added a second, independent anti-join over the recipe's own
+  name (`common.build_name_exclusions` -> `recipe_name_exclusions` table,
+  applied in `recipe_store._diet_clauses`), skipped when the title itself
+  signals an intentional meat-free version ("Vegetarian Chicken Nuggets").
+Rerun `python etl/run_all.py` (or `etl/build_fixtures.py`) to apply from scratch.
+
 ### V4 — anchor-ingredient matching (spec section 15)
 - **Strict protein match**: when a user enters an anchor ingredient such as chicken, salmon, tofu, or protein powder, search applies a hard filter before scoring so results must feature that protein family.
 - **No protein leakage by default**: a chicken search will not return pork, shrimp, or anchor-free recipes just because the side ingredients match well. The UI includes a "Strict protein match" checkbox; turning it off allows recipes with additional proteins.

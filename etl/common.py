@@ -6,6 +6,7 @@ the real Food.com pipeline (run_all.py) and the fixtures builder.
 
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS recipes (
     n_ratings INTEGER DEFAULT 0,
     calories REAL,
     macros_json TEXT,
-    diet_flags INTEGER DEFAULT 0
+    diet_flags INTEGER DEFAULT 0,
+    quality_score REAL
 );
 CREATE TABLE IF NOT EXISTS ingredients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +61,11 @@ CREATE TABLE IF NOT EXISTS diet_exclusions (
 );
 CREATE INDEX IF NOT EXISTS idx_de_diet ON diet_exclusions (diet, ingredient_id);
 CREATE INDEX IF NOT EXISTS idx_de_ing  ON diet_exclusions (ingredient_id);
+CREATE TABLE IF NOT EXISTS recipe_name_exclusions (
+    recipe_id INTEGER NOT NULL,
+    diet TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rne_diet ON recipe_name_exclusions (diet, recipe_id);
 """
 
 FTS_SCHEMA = """
@@ -285,6 +292,41 @@ def build_diet_exclusions(conn):
     return len(rows)
 
 
+# A recipe's title is a hard-to-fake signal ("Curried Shrimp") that the
+# dataset sometimes disagrees with itself about: some rows have their real
+# ingredient list truncated/corrupted upstream (the shrimp is in the title
+# but not in RecipeIngredientParts), and some carry a self-reported
+# "vegetarian"/"vegan" keyword tag that's simply wrong. diet_exclusions (the
+# ingredient-based anti-join) can't catch either case, so this is a second,
+# independent anti-join over the recipe name.
+#
+# Skip the name check when the title itself signals an intentional
+# meat-free/plant-based version ("Vegetarian Chicken Nuggets", "Mock Duck")
+# so we don't punish recipes for using a meat word to describe a substitute.
+VEG_SIGNAL_GROUPS = [
+    {"vegetarian"}, {"vegan"}, {"veggie"}, {"meatless"}, {"meat", "free"},
+    {"plant", "based"}, {"mock"}, {"faux"}, {"fake"}, {"imitation"},
+]
+
+
+def build_name_exclusions(conn):
+    """Spec 11.2 follow-up — name-derived anti-join, independent of both the
+    ingredient list and the dataset's self-reported diet tags."""
+    conn.execute("DELETE FROM recipe_name_exclusions")
+    rows = conn.execute("SELECT id, name FROM recipes").fetchall()
+    out = []
+    for rid, name in rows:
+        name_tokens = token_set(name)
+        if any(group <= name_tokens for group in VEG_SIGNAL_GROUPS):
+            continue
+        for diet, keywords in EXCLUSION_KEYWORDS.items():
+            if any(keyword_hits(kw, name) for kw in keywords):
+                out.append((rid, diet))
+    conn.executemany(
+        "INSERT INTO recipe_name_exclusions (recipe_id, diet) VALUES (?, ?)", out)
+    return len(out)
+
+
 def build_synonyms(conn):
     """Seed ingredient_synonyms from the normalize.py dictionary, mapped to
     whatever canonical names actually exist in this DB's vocabulary."""
@@ -340,3 +382,104 @@ def insert_recipe_ingredients(conn, recipe_id, raw_ingredient_names):
 
 def dumps(obj):
     return json.dumps(obj, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Recipe-quality cleanup: Bayesian-averaged ranking signal + near-duplicate
+# collapsing. Both address the same complaint (raw dataset dump surfaces
+# junky/near-identical/unreliably-rated recipes ahead of genuinely good ones).
+# ---------------------------------------------------------------------------
+
+QUALITY_PRIOR_COUNT = 5  # "votes" of weight given to the dataset-wide average
+
+
+def apply_quality_scores(conn, prior_count=QUALITY_PRIOR_COUNT):
+    """
+    Bayesian-average rating (the same shape IMDB's "weighted rating" uses):
+
+        quality_score = (v * R + m * C) / (v + m)
+
+    v = this recipe's n_ratings, R = its avg_rating, C = the dataset-wide
+    mean rating (over recipes that have at least one rating), m = prior_count.
+
+    A recipe with one 5-star rating no longer outranks one with hundreds of
+    ratings averaging 4.6 — with v=0 the score collapses to C, so unrated
+    recipes land at the dataset average rather than at the top or bottom.
+    """
+    try:
+        conn.execute("ALTER TABLE recipes ADD COLUMN quality_score REAL")
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
+    row = conn.execute(
+        "SELECT AVG(avg_rating) FROM recipes WHERE n_ratings > 0 AND avg_rating IS NOT NULL"
+    ).fetchone()
+    dataset_mean = row[0] if row and row[0] is not None else 4.0
+
+    rows = conn.execute(
+        "SELECT id, avg_rating, n_ratings FROM recipes"
+    ).fetchall()
+    updates = []
+    for rid, avg_rating, n_ratings in rows:
+        v = n_ratings or 0
+        r = avg_rating if avg_rating is not None else 0.0
+        score = (v * r + prior_count * dataset_mean) / (v + prior_count)
+        updates.append((round(score, 4), rid))
+    conn.executemany("UPDATE recipes SET quality_score = ? WHERE id = ?", updates)
+    return len(updates)
+
+
+_TRAILING_TAG_RE = re.compile(r"\s*#\s*\d+\s*$")
+_PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
+
+
+def _name_stem(name):
+    """Collapse numbered variants ("Sourdough Starter #1".."#6") onto one key."""
+    stem = _TRAILING_TAG_RE.sub("", (name or "").lower())
+    stem = _PUNCT_RE.sub(" ", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def dedupe_recipes(conn):
+    """
+    Collapse near-duplicate recipes: same name stem (ignoring a trailing
+    "#N" variant tag) AND the same normalized ingredient set. Keeps whichever
+    copy has the most ratings (then the higher quality signal); deletes the
+    rest from `recipes`, `recipe_ingredients`, and `_recipe_tags`.
+
+    Must run before build_ingredient_index.py wipes/rebuilds the inverted
+    index, since it only needs `recipes.raw_ingredients_json`.
+    """
+    rows = conn.execute(
+        "SELECT id, name, raw_ingredients_json, avg_rating, n_ratings FROM recipes"
+    ).fetchall()
+
+    groups = {}
+    for rid, name, raw_json, avg_rating, n_ratings in rows:
+        try:
+            raw = json.loads(raw_json or "[]")
+        except (TypeError, ValueError):
+            raw = []
+        names = frozenset(
+            normalize_ingredient(e["name"] if isinstance(e, dict) else e)
+            for e in raw
+        )
+        key = (_name_stem(name), names)
+        groups.setdefault(key, []).append(
+            (rid, n_ratings or 0, avg_rating or 0.0))
+
+    to_delete = []
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: (-m[1], -m[2]))
+        to_delete.extend(m[0] for m in members[1:])
+
+    if not to_delete:
+        return 0
+
+    ph = ",".join("?" * len(to_delete))
+    conn.execute(f"DELETE FROM recipes WHERE id IN ({ph})", to_delete)
+    conn.execute(f"DELETE FROM _recipe_tags WHERE recipe_id IN ({ph})", to_delete)
+    conn.execute(f"DELETE FROM recipe_ingredients WHERE recipe_id IN ({ph})", to_delete)
+    return len(to_delete)

@@ -14,7 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DATA_DIR, create_schema, rebuild_fts, build_synonyms, build_diet_exclusions,
-    diet_flags_from_tags, insert_recipe_ingredients, dumps,
+    diet_flags_from_tags, insert_recipe_ingredients, dumps, apply_quality_scores,
+    build_name_exclusions,
 )
 
 # (id, name, minutes, tags, ingredients, steps, per-serving nutrition, rating, n_ratings)
@@ -236,6 +237,14 @@ FIXTURE_RECIPES = [
      ["pasta", "chicken breasts", "basil pesto", "parmesan cheese", "olive oil", "pine nuts"],
      ["boil pasta", "cook chicken", "toss with pesto and parmesan"],
      (640, 30, 3, 720, 40, 8, 54), 4.5, 186),
+    # Regression fixture (spec 11.2 follow-up): mirrors a real Food.com data
+    # bug where a recipe's parsed ingredient list drops the very ingredient
+    # its title promises ("shrimp" missing from RecipeIngredientParts). The
+    # ingredient-based anti-join can't catch this; only the name-based one can.
+    (51, "curried shrimp surprise", 25, [],
+     ["onion", "curry powder", "sour cream"],
+     ["cook onion with curry powder", "stir in sour cream"],
+     (310, 8, 4, 480, 4, 12, 18), 4.0, 22),
 ]
 
 
@@ -276,7 +285,9 @@ def main(db_path=None):
                      WHERE recipe_id = recipes.id)""")
     build_synonyms(conn)
     build_diet_exclusions(conn)
+    build_name_exclusions(conn)
     rebuild_fts(conn)
+    apply_quality_scores(conn)
     conn.commit()
 
     n = conn.execute("SELECT COUNT(*) FROM recipes").fetchone()[0]

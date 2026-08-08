@@ -414,6 +414,7 @@ async function loadNutrition(recipe) {
       </div>
       ${totalCal && data.servings > 1 ? `<p style="font-size:0.8rem;color:var(--muted)">Total for ${data.servings} servings: ${totalCal} calories</p>` : ""}
       ${data.source ? `<p style="font-size:0.8rem;color:var(--muted)">${escapeHtml(data.source)}</p>` : ""}
+      ${data.caveat ? `<p style="font-size:0.8rem;color:#b45309">⚠ ${escapeHtml(data.caveat)}</p>` : ""}
     `;
   } catch (err) {
     area.innerHTML = `<div class="error-box">Nutrition lookup failed: ${escapeHtml(String(err))}</div>`;

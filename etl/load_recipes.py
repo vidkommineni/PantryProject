@@ -14,6 +14,8 @@ Stashes Keywords + RecipeCategory per recipe in _recipe_tags for
 derive_diet_flags.py.
 """
 
+import html
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -21,8 +23,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DATA_DIR, create_schema, build_macros, parse_r_vector,
-    parse_iso_duration_minutes, dumps,
+    parse_iso_duration_minutes, dumps, apply_quality_scores,
+    dedupe_recipes,
 )
+
+# Minimum real ingredients for something to count as a matchable recipe.
+# Below this the dataset is mostly prep-tips / single-item "recipes" ("Roasting
+# Peppers", "Cafe Latte") that clutter search results without being cookable
+# from a pantry match (spec: recipe-quality cleanup).
+MIN_INGREDIENTS = 2
+
+
+def _clean_text(value):
+    """Decode HTML entities (&amp;, &aacute;, ...) baked into the raw dataset
+    and collapse stray whitespace."""
+    if not isinstance(value, str):
+        return value
+    text = html.unescape(value)
+    return re.sub(r"[ \t]+", " ", text).strip()
 
 CHUNK = 5000
 
@@ -86,10 +104,14 @@ def main(db_path=None, recipes_path=None):
         recipe_rows, tag_rows = [], []
         for rec in chunk.itertuples(index=False):
             total += 1
-            steps = [s for s in parse_r_vector(_row_get(rec, "RecipeInstructions"))
-                     if s and s.upper() != "NA"]
-            parts = parse_r_vector(_row_get(rec, "RecipeIngredientParts"))
-            if not steps or not parts:
+            steps = [_clean_text(s) for s in parse_r_vector(_row_get(rec, "RecipeInstructions"))
+                     if s and str(s).upper() != "NA"]
+            parts = [_clean_text(p) for p in parse_r_vector(_row_get(rec, "RecipeIngredientParts"))]
+            parts = [p for p in parts if p]
+            # Drop prep-tips / single-item non-recipes ("Roasting Peppers",
+            # "Cafe Latte") — they clutter pantry-match results without being
+            # real cookable recipes.
+            if not steps or len(parts) < MIN_INGREDIENTS:
                 continue
             quantities = parse_r_vector(_row_get(rec, "RecipeIngredientQuantities"))
             display = []
@@ -102,7 +124,7 @@ def main(db_path=None, recipes_path=None):
             minutes = (parse_iso_duration_minutes(_row_get(rec, "TotalTime"))
                        or parse_iso_duration_minutes(_row_get(rec, "PrepTime")))
             desc = _row_get(rec, "Description")
-            desc = desc if isinstance(desc, str) else ""
+            desc = _clean_text(desc) if isinstance(desc, str) else ""
             images = parse_r_vector(_row_get(rec, "Images"))
             image_url = next((u for u in images if str(u).startswith("http")), None)
             servings = _num(_row_get(rec, "RecipeServings"))
@@ -122,8 +144,9 @@ def main(db_path=None, recipes_path=None):
             )
 
             rid = int(_row_get(rec, "RecipeId"))
+            name = _clean_text(str(_row_get(rec, "Name"))) or f"Recipe {rid}"
             recipe_rows.append((
-                rid, str(_row_get(rec, "Name")), minutes, len(steps), dumps(steps),
+                rid, name, minutes, len(steps), dumps(steps),
                 desc, len(parts), dumps(display), image_url, servings,
                 _num(_row_get(rec, "AggregatedRating")),
                 int(_num(_row_get(rec, "ReviewCount")) or 0),
@@ -144,8 +167,17 @@ def main(db_path=None, recipes_path=None):
         conn.commit()
         print(f"  loaded {kept}/{total} recipes...", end="\r")
 
-    conn.close()
     print(f"\nload_recipes: kept {kept} of {total} rows -> {db_path}")
+
+    n_dupes = dedupe_recipes(conn)
+    print(f"load_recipes: removed {n_dupes} near-duplicate recipes "
+          f"(same name stem + ingredient set, kept the best-rated copy)")
+
+    n_scored = apply_quality_scores(conn)
+    print(f"load_recipes: computed quality_score for {n_scored} recipes")
+
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

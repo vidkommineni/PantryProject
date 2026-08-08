@@ -112,11 +112,27 @@ def resolve_terms(terms):
 # Search (spec 11.1 + 11.2)
 # ---------------------------------------------------------------------------
 
+_INGREDIENT_ANTI_JOIN = (
+    "r.id NOT IN (SELECT ri2.recipe_id FROM recipe_ingredients ri2 "
+    "JOIN diet_exclusions de ON de.ingredient_id = ri2.ingredient_id "
+    "WHERE de.diet = ?)"
+)
+# Second, independent anti-join over the recipe's own name (spec 11.2
+# follow-up). Some dataset rows have a corrupted/truncated ingredient list
+# that drops the very ingredient that disqualifies them ("Curried Shrimp"
+# with "shrimp" missing from its parsed ingredients) or a bogus self-reported
+# "vegetarian" tag; the title still gives it away, so this catches what the
+# ingredient-based anti-join and the tag-derived flag both miss.
+_NAME_ANTI_JOIN = "r.id NOT IN (SELECT recipe_id FROM recipe_name_exclusions WHERE diet = ?)"
+
+
 def _diet_clauses(diets, intolerances, params):
     """
     Spec 11.2 — hard filters pushed into the WHERE clause:
       - tag-derived flag bit (for tag-enforced diets), AND
-      - indexed anti-join against diet_exclusions for every diet/intolerance.
+      - indexed anti-join against diet_exclusions for every diet/intolerance, AND
+      - indexed anti-join against recipe_name_exclusions (belt-and-suspenders
+        against corrupted ingredient rows / bogus self-reported diet tags).
     """
     clauses = []
     for diet in (diets or []):
@@ -126,21 +142,17 @@ def _diet_clauses(diets, intolerances, params):
         bit = DIET_FLAG_BITS.get(diet)
         if diet in TAG_ENFORCED_DIETS and bit:
             clauses.append(f"(r.diet_flags & {bit}) != 0")
-        clauses.append(
-            "r.id NOT IN (SELECT ri2.recipe_id FROM recipe_ingredients ri2 "
-            "JOIN diet_exclusions de ON de.ingredient_id = ri2.ingredient_id "
-            "WHERE de.diet = ?)"
-        )
+        clauses.append(_INGREDIENT_ANTI_JOIN)
+        params.append(diet)
+        clauses.append(_NAME_ANTI_JOIN)
         params.append(diet)
     for intol in (intolerances or []):
         intol = intol.strip().lower()
         if not intol:
             continue
-        clauses.append(
-            "r.id NOT IN (SELECT ri2.recipe_id FROM recipe_ingredients ri2 "
-            "JOIN diet_exclusions de ON de.ingredient_id = ri2.ingredient_id "
-            "WHERE de.diet = ?)"
-        )
+        clauses.append(_INGREDIENT_ANTI_JOIN)
+        params.append(intol)
+        clauses.append(_NAME_ANTI_JOIN)
         params.append(intol)
     return clauses
 
@@ -182,14 +194,15 @@ def fetch_candidates(ingredient_ids, diets=None, intolerances=None,
 
     sql = f"""
         SELECT r.id, r.name, r.minutes, r.n_ingredients, r.avg_rating, r.n_ratings,
-               r.image_url,
+               r.quality_score, r.image_url,
                COUNT(*) AS used_count,
                r.n_ingredients - COUNT(*) AS missing_count
         FROM recipe_ingredients ri
         JOIN recipes r ON r.id = ri.recipe_id
         WHERE ri.ingredient_id IN ({placeholders}){where_sql}
         GROUP BY r.id
-        ORDER BY missing_count ASC, used_count DESC
+        ORDER BY missing_count ASC, used_count DESC,
+                 COALESCE(r.quality_score, r.avg_rating, 0) DESC
         LIMIT ?
     """
     with connect() as conn:
@@ -224,6 +237,11 @@ def _attach_ingredient_lists(conn, candidates, matched_ids):
         c["title"] = c.pop("name")
         c["avgRating"] = c.pop("avg_rating")
         c["nRatings"] = c.pop("n_ratings")
+        # Bayesian-averaged ranking signal (etl/common.py apply_quality_scores);
+        # falls back to raw avgRating for DBs built before this column existed.
+        c["qualityScore"] = c.pop("quality_score", None)
+        if c["qualityScore"] is None:
+            c["qualityScore"] = c["avgRating"] or 0.0
         c["imageUrl"] = c.pop("image_url", None)
         c["usedIngredients"] = used
         c["missedIngredients"] = missed

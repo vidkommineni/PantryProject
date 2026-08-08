@@ -21,7 +21,7 @@ import recipe_store
 import roles
 import search as search_engine
 from normalize import normalize_ingredients
-from quantities import scale_quantity
+from quantities import format_scaled_ingredient
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
@@ -268,7 +268,7 @@ def recipe_detail(recipe_id):
         scaled.append({
             "name": ing["name"],
             "amount": ing.get("amount"),
-            "scaledAmount": scale_quantity(ing.get("amount"), factor),
+            "scaledAmount": format_scaled_ingredient(ing["name"], ing.get("amount"), factor),
         })
 
     return jsonify({
@@ -302,7 +302,9 @@ def recipe_nutrition(recipe_id):
         return jsonify({"error": "No nutrition data for this recipe."}), 200
     # Tier-1 values are a single indexed read — no cache needed. The
     # RecipeNutritionCache table returns in Phase 4 for computed Tier-2 values.
-    payload = nutrition.build_payload(per_serving, servings)
+    recipe = recipe_store.get_recipe(recipe_id)
+    ingredient_names = recipe.get("ingredients") if recipe else None
+    payload = nutrition.build_payload(per_serving, servings, ingredient_names)
     payload["cached"] = False
     return jsonify(payload)
 

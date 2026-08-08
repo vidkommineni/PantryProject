@@ -144,7 +144,11 @@ def _key_best_match(r):
         -r.get("coreUsedCount", 0),   # user-entered ingredients beat spice matches
         r.get("realMissingCount", 0),
         ready if isinstance(ready, (int, float)) else 10 ** 6,
-        -(r.get("avgRating") or 0.0),          # v3 tie-breaker: dataset rating
+        # v3 tie-breaker: Bayesian-averaged rating (falls back to raw avgRating
+        # for older DBs) so a recipe with one 5-star rating can't outrank one
+        # with hundreds of ratings averaging 4.6.
+        -(r.get("qualityScore") if r.get("qualityScore") is not None
+          else (r.get("avgRating") or 0.0)),
         -(r.get("nRatings") or 0),
     )
 

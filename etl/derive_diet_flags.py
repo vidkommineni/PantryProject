@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DATA_DIR, DIET_FLAG_BITS, FLAG_TO_EXCLUSION_KEY,
-    build_diet_exclusions, diet_flags_from_tags,
+    build_diet_exclusions, diet_flags_from_tags, build_name_exclusions,
 )
 
 
@@ -28,6 +28,7 @@ def main(db_path=None):
     conn = sqlite3.connect(db_path)
 
     n_excl = build_diet_exclusions(conn)
+    n_name_excl = build_name_exclusions(conn)
 
     # 1. Keyword-derived flags.
     flags_by_recipe = {}
@@ -58,7 +59,7 @@ def main(db_path=None):
     conn.commit()
     conn.close()
     print(f"derive_diet_flags: flags on {len(flags_by_recipe)} recipes, "
-          f"{n_excl} diet-exclusion rows")
+          f"{n_excl} diet-exclusion rows, {n_name_excl} name-exclusion rows")
 
 
 if __name__ == "__main__":
