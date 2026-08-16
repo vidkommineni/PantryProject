@@ -2,6 +2,10 @@
 # no external HTTP at runtime.
 flask==3.0.3
 
+# Production WSGI server — used by the Docker image. `python app.py` still
+# runs Flask's dev server locally, so this only matters in the container.
+gunicorn==23.0.0
+
 # V2 (spec 8) — unit tests for the pure functions.
 pytest==8.3.3
 

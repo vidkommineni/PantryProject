@@ -1,0 +1,29 @@
+# Development overlay — layer this ON TOP of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Worth aliasing:  alias pantry-dev='docker compose -f docker-compose.yml -f docker-compose.dev.yml'
+#
+# Differences from the base stack: the dev build target, source bind-mounted so
+# edits reload instantly, Flask's debugger on, and no restart policy (a crash
+# should surface, not silently loop).
+
+services:
+  app:
+    build:
+      target: dev
+    # Separate tag, so building dev doesn't overwrite your prod image.
+    image: pantry-app:dev
+    container_name: pantry-app-dev
+    volumes:
+      # Your working tree shadows the copy baked into the image, so saving a
+      # .py file triggers Flask's reloader and saving a .js/.css file is picked
+      # up on the next request.
+      - ./app:/app/app
+      - ./data:/app/data:ro
+      - pantry-userdata:/app/userdata
+    environment:
+      FLASK_APP: app
+      FLASK_DEBUG: "1"
+      PANTRY_USER_DB: /app/userdata/pantry.db
+    restart: "no"

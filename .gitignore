@@ -1,2 +1,40 @@
+# --- Secrets ---
+.env
 app/backend/.env
-app/backend/.env
+
+# --- Virtualenvs ---
+venv/
+.venv/
+app/backend/venv/
+
+# --- Python bytecode / tooling caches ---
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Databases ---
+# fixtures.db IS committed (small, needed for tests); everything else is built.
+data/pantry.db
+data/raw/
+app/backend/pantry.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# --- FUSE mount artifacts (created when a file is deleted while still open) ---
+.fuse_hidden*
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Temporary holding area for files pending deletion ---
+_to_delete/

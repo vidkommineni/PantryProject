@@ -13,12 +13,17 @@ since V1 is local-storage-only / single-user, no accounts yet):
   nutrition_cache    - kept for Phase 4 Tier-2 computed nutrition (spec 11.4)
 """
 
+import os
 import sqlite3
 import json
 from pathlib import Path
 from contextlib import contextmanager
 
-DB_PATH = Path(__file__).parent / "pantry.db"
+# Defaults to app/backend/pantry.db for a plain local run. $PANTRY_USER_DB
+# relocates it — the Docker image points this at a mounted volume so the file
+# lives outside the source tree and survives container rebuilds. Mirrors the
+# $PANTRY_DB override that recipe_store.py already supports for the recipe DB.
+DB_PATH = Path(os.environ.get("PANTRY_USER_DB") or Path(__file__).parent / "pantry.db")
 
 DEFAULT_STAPLES = [
     "salt", "pepper", "black pepper", "oil", "olive oil",
@@ -51,6 +56,9 @@ def get_conn():
 
 
 def init_db():
+    # $PANTRY_USER_DB may point somewhere that doesn't exist yet (a fresh
+    # Docker volume, for instance) — sqlite3.connect won't create the parent.
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS staples (

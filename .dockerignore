@@ -1,0 +1,48 @@
+# What gets sent to the Docker daemon on every build.
+# Without this file the context is ~1.9 GB; with it, well under 1 MB.
+
+# --- Version control ---
+.git/
+.gitignore
+
+# --- The heavy data (bind-mounted at runtime, never baked into the image) ---
+data/pantry.db
+data/pantry.db-shm
+data/pantry.db-wal
+data/raw/
+data/.fuse_hidden*
+*.db-journal
+# NOTE: data/fixtures.db is deliberately NOT ignored — it's 110 KB and gets
+# baked in so the image runs standalone with no mounts.
+
+# --- Local virtualenv: the image builds its own ---
+app/backend/venv/
+.venv/
+venv/
+
+# --- Python bytecode / test caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Runtime user-preference DB (lives in a named volume in the container) ---
+app/backend/pantry.db
+
+# --- Secrets ---
+.env
+app/backend/.env
+
+# --- Editor / OS cruft ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Docs and Docker files themselves ---
+files/
+Dockerfile*
+docker-compose*.yml
+.dockerignore

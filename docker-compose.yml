@@ -1,0 +1,37 @@
+# Production-shaped stack: gunicorn, non-root, restart policy.
+#
+#   docker compose up --build          # run it
+#   docker compose down                # stop (named volume survives)
+#   docker compose down -v             # stop and wipe saved staples/spices/favorites
+#
+# For live-reload development, layer the dev file on top:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+
+services:
+  app:
+    build:
+      context: .
+      target: prod
+    image: pantry-app:latest
+    container_name: pantry-app
+    ports:
+      - "5000:5000"
+    volumes:
+      # Read-only bind of your local data/ directory. This is what keeps the
+      # 1.1 GB recipe DB out of the image: recipe_store.py finds
+      # /app/data/pantry.db if you've built it, and silently falls back to
+      # /app/data/fixtures.db if you haven't.
+      #
+      # Do NOT set PANTRY_DB here — the override skips the existence check in
+      # recipe_store.db_path(), which would break that fallback.
+      - ./data:/app/data:ro
+
+      # Named volume for the user-preference DB, so staples, spices, favorites
+      # and exclusions survive `docker compose down` and image rebuilds.
+      - pantry-userdata:/app/userdata
+    environment:
+      PANTRY_USER_DB: /app/userdata/pantry.db
+    restart: unless-stopped
+
+volumes:
+  pantry-userdata:
