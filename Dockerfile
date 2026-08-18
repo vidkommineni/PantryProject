@@ -66,7 +66,7 @@ CMD ["flask", "run", "--host", "0.0.0.0", "--port", "5000", "--debug"]
 FROM base AS prod
 
 RUN useradd --create-home --uid 10001 pantry \
- && chown -R pantry:pantry /app/userdata
+    && chown -R pantry:pantry /app
 USER pantry
 
 # Hits the static index route: proves the process is serving without touching
